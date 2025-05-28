@@ -5,3 +5,5 @@ wandb
 fire
 opencv-python
 omegaconf
+h5py 
+numpy

@@ -7,33 +7,36 @@ from transformers import (
     AutoImageProcessor,
     TimesformerForVideoClassification,
     TimesformerConfig,
+    get_cosine_schedule_with_warmup,  # Added for LR scheduling
 )
 from decord import VideoReader, cpu
 import numpy as np
 from tqdm import tqdm
 import evaluate  # For accuracy metric
-import matplotlib.pyplot as plt  # Added for plotting
+import matplotlib.pyplot as plt
 
 # --- Configuration ---
-VIDEO_ROOT_DIR = "/home/elicer/yt-8m"  # Root directory of your dataset
+VIDEO_ROOT_DIR = "yt-8m"
 TRAIN_DIR = os.path.join(VIDEO_ROOT_DIR, "train")
 VAL_DIR = os.path.join(VIDEO_ROOT_DIR, "validation")
 PRETRAINED_MODEL_NAME = "facebook/timesformer-base-finetuned-k400"
 
 NUM_CLASSES = 10
-BATCH_SIZE = 8
-NUM_EPOCHS = 10  # Increase for better plots, e.g., 10 or 20
-LEARNING_RATE = 3e-5
+BATCH_SIZE = 4
+NUM_EPOCHS = 5  # Consider increasing for scheduler to have more effect
+LEARNING_RATE = 3e-5  # Initial learning rate
+WARMUP_PROPORTION = 0.1  # Proportion of total training steps for linear warmup
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-PLOT_FILENAME = "training_metrics.png"  # Name of the output plot file
+PLOT_FILENAME = "training_metrics.png"
+NUM_WORKERS = 4  # Number of workers for DataLoader
 
 
-# --- Video Dataset Class (Modified __getitem__ method) ---
+# --- Video Dataset Class ---
 class VideoClassificationDataset(Dataset):
     def __init__(self, video_dir, image_processor, num_frames, class_to_idx=None):
         self.video_dir = video_dir
         self.image_processor = image_processor
-        self.num_frames = num_frames  # This should be model_config.num_frames
+        self.num_frames = num_frames
         self.video_files = []
         self.labels = []
 
@@ -59,17 +62,11 @@ class VideoClassificationDataset(Dataset):
 
     def _sample_frames(self, video_path):
         try:
-            # Using a default size for dummy frames if video reading fails.
-            # This size should ideally match the processor's expected input size or be resizable by it.
-            dummy_frame_height, dummy_frame_width = 224, 224  # Common default
-            # Attempt to get actual size from processor if possible, though it's complex here.
-            # For now, using a fixed common default for dummy frames.
-
+            dummy_frame_height, dummy_frame_width = 224, 224
             vr = VideoReader(video_path, ctx=cpu(0))
             total_frames = len(vr)
             if total_frames == 0:
-                # Try to re-initialize, sometimes helps with network drives or temporary issues
-                vr = VideoReader(video_path, ctx=cpu(0))
+                vr = VideoReader(video_path, ctx=cpu(0))  # Retry
                 total_frames = len(vr)
                 if total_frames == 0:
                     print(
@@ -84,18 +81,19 @@ class VideoClassificationDataset(Dataset):
 
             indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
             frames = vr.get_batch(indices).asnumpy()
-            # Ensure frames are not empty and have correct basic structure (H,W,C)
             if (
-                frames.size == 0 or frames.ndim != 4 or frames.shape[3] != 3
-            ):  # Expecting (NF, H, W, C)
+                frames.size == 0
+                or frames.ndim != 4
+                or frames.shape[3] != 3
+                or frames.shape[0] != self.num_frames
+            ):
                 print(
-                    f"Warning: Video {video_path} yielded problematic frames (shape: {frames.shape}). Returning dummy frames."
+                    f"Warning: Video {video_path} yielded problematic frames (shape: {frames.shape}, expected NF={self.num_frames}). Returning dummy frames."
                 )
                 return [
                     np.zeros((dummy_frame_height, dummy_frame_width, 3), dtype=np.uint8)
                     for _ in range(self.num_frames)
                 ]
-
             return list(frames)
         except Exception as e:
             print(
@@ -103,69 +101,42 @@ class VideoClassificationDataset(Dataset):
             )
             return [
                 np.zeros((224, 224, 3), dtype=np.uint8) for _ in range(self.num_frames)
-            ]  # Fallback dummy frames
+            ]
 
     def __getitem__(self, idx):
         video_path = self.video_files[idx]
         label = self.labels[idx]
-
-        frames_list_hwc = self._sample_frames(video_path)  # List of HWC numpy arrays
+        frames_list_hwc = self._sample_frames(video_path)
 
         processed_output = self.image_processor(frames_list_hwc, return_tensors="pt")
         pixel_values = processed_output.pixel_values
 
-        # Squeeze if an unnecessary batch dimension was added by the processor
         if pixel_values.ndim == 5 and pixel_values.shape[0] == 1:
-            pixel_values = pixel_values.squeeze(0)  # Now pixel_values should be 4D
+            pixel_values = pixel_values.squeeze(0)
 
-        # Ensure tensor is 4D before attempting 4D permutations
         if pixel_values.ndim != 4:
-            # This can happen if _sample_frames returned dummy frames that weren't processed correctly
-            # or if the processor behaved very unexpectedly.
             error_message = (
                 f"Critical Error: pixel_values for video {video_path} has {pixel_values.ndim} dimensions "
                 f"(shape: {pixel_values.shape}) after processor and potential squeeze. Expected 4D. "
-                f"This might be due to issues reading the video or with the dummy frames fallback. "
-                f"Frames list length: {len(frames_list_hwc)}, first frame shape if available: {frames_list_hwc[0].shape if frames_list_hwc else 'N/A'}."
+                f"Frames list length: {len(frames_list_hwc)}, first frame shape if available: {frames_list_hwc[0].shape if frames_list_hwc and hasattr(frames_list_hwc[0], 'shape') else 'N/A'}."
             )
-            print(error_message)  # Print error for easier debugging from logs
-            # To make it fail hard and not proceed with a wrongly shaped tensor:
+            print(error_message)
             raise ValueError(error_message)
-            # Alternatively, return a specific error indicator or skip, but raising helps debug.
 
-        # Now, pixel_values is 4D.
-        # The model expects input of shape (num_frames, num_channels, height, width) per item.
-
-        # Case 1: Input is (num_channels, num_frames, H, W)
-        # Example: shape (3, 8, 224, 224) for num_frames=8
         if (
             pixel_values.shape[1] == self.num_frames
             and pixel_values.shape[0] != self.num_frames
         ):
-            pixel_values = pixel_values.permute(
-                1, 0, 2, 3
-            )  # Convert to (num_frames, num_channels, H, W)
-
-        # Case 2: Input is already (num_frames, num_channels, H, W)
-        # Example: shape (8, 3, 224, 224) for num_frames=8
+            pixel_values = pixel_values.permute(1, 0, 2, 3)
         elif pixel_values.shape[0] == self.num_frames:
-            # Assuming if the first dimension is num_frames, it's likely (NF, C, H, W)
-            # (VideoMAEImageProcessor usually places channels before H, W)
-            pass  # Already in the correct format
-
-        # Case 3: Unhandled 4D shape
+            pass
         else:
-            # This condition is met if the 4D tensor's dimensions don't match the expected patterns
-            # involving self.num_frames in either the first or second dimension as anticipated.
             print(
                 f"Warning: pixel_values for video {video_path} has an unhandled 4D shape: {pixel_values.shape} "
                 f"(num_frames expected: {self.num_frames}). "
                 "The model expects input of shape (num_frames, num_channels, height, width) per item. "
-                "Please check video integrity and processor output alignment."
+                "Ensure video integrity and processor output alignment."
             )
-            # Depending on strictness, you might raise an error or try a fallback.
-            # For now, it will pass through with the potentially incorrect shape, which might cause issues later.
-
         return {
             "pixel_values": pixel_values,
             "labels": torch.tensor(label, dtype=torch.long),
@@ -174,9 +145,11 @@ class VideoClassificationDataset(Dataset):
 
 # --- Function to plot metrics ---
 def plot_and_save_metrics(
-    epochs_list, train_losses, val_losses, val_accuracies, filename
+    epochs_list, train_losses, val_losses, val_accuracies, train_lrs, filename
 ):
-    fig, ax1 = plt.subplots(figsize=(10, 6))
+    fig, ax1 = plt.subplots(
+        figsize=(12, 8)
+    )  # Increased size for better readability with LR
 
     # Plotting training and validation loss
     color = "tab:red"
@@ -202,9 +175,9 @@ def plot_and_save_metrics(
     ax1.legend(loc="upper left")
 
     # Creating a second y-axis for validation accuracy
-    ax2 = ax1.twinx()  # instantiate a second axes that shares the same x-axis
+    ax2 = ax1.twinx()
     color = "tab:blue"
-    ax2.set_ylabel("Accuracy", color=color)  # we already handled the x-label with ax1
+    ax2.set_ylabel("Accuracy", color=color)
     ax2.plot(
         epochs_list,
         val_accuracies,
@@ -216,11 +189,30 @@ def plot_and_save_metrics(
     ax2.tick_params(axis="y", labelcolor=color)
     ax2.legend(loc="upper right")
 
-    fig.tight_layout()  # otherwise the right y-label is slightly clipped
+    # Creating a third y-axis for learning rate
+    ax3 = ax1.twinx()
+    # Offset the third axis to prevent overlap with ax2's labels
+    ax3.spines["right"].set_position(("outward", 60))  # Adjust 60 as needed
+    color = "tab:green"
+    ax3.set_ylabel("Learning Rate", color=color)
+    # Plot average LR for each epoch, or LR at the end of epoch
+    ax3.plot(
+        epochs_list,
+        train_lrs,
+        color=color,
+        linestyle="-.",
+        marker="^",
+        label="Learning Rate (End of Epoch)",
+    )
+    ax3.tick_params(axis="y", labelcolor=color)
+    ax3.legend(loc="lower left")
+    ax3.set_yscale("log")  # Often useful for LR plots
+
+    fig.tight_layout()
     plt.title("Training and Validation Metrics")
     plt.savefig(filename)
     print(f"Metrics plot saved to {filename}")
-    plt.close(fig)  # Close the figure to free memory
+    plt.close(fig)
 
 
 # --- Main Training Script ---
@@ -250,66 +242,75 @@ if __name__ == "__main__":
         class_to_idx=train_dataset.class_to_idx,
     )
 
-    print(
-        f"Found {len(train_dataset.class_names)} classes: {train_dataset.class_names}"
-    )
-    if len(train_dataset.class_names) != NUM_CLASSES:
+    actual_num_classes = len(train_dataset.class_names)
+    print(f"Found {actual_num_classes} classes: {train_dataset.class_names}")
+    if actual_num_classes != NUM_CLASSES:
         print(
-            f"Warning: Expected {NUM_CLASSES} classes, but found {len(train_dataset.class_names)} in {TRAIN_DIR}. Using found number."
+            f"Warning: Configured NUM_CLASSES ({NUM_CLASSES}) differs from found classes ({actual_num_classes}). Using {actual_num_classes}."
         )
-        # NUM_CLASSES = len(train_dataset.class_names) # Using actual found classes
+        # NUM_CLASSES = actual_num_classes # Use actual number of classes found
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=4,
+        num_workers=NUM_WORKERS,
         pin_memory=True,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=4,
+        num_workers=NUM_WORKERS,
         pin_memory=True,
     )
     print("DataLoaders created.")
 
-    # 3. Initialize Model, Optimizer, Criterion
+    # 3. Initialize Model and Optimizer
     print(f"Loading pre-trained model: {PRETRAINED_MODEL_NAME}...")
     model = TimesformerForVideoClassification.from_pretrained(
         PRETRAINED_MODEL_NAME,
-        num_labels=len(train_dataset.class_names),
+        num_labels=actual_num_classes,
         ignore_mismatched_sizes=True,
     ).to(DEVICE)
     print("Model loaded.")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    criterion = (
-        torch.nn.CrossEntropyLoss()
-    )  # Not directly used if model calculates loss internally
     accuracy_metric = evaluate.load("accuracy")
+
+    # 4. Initialize Learning Rate Scheduler
+    num_training_steps = NUM_EPOCHS * len(train_loader)
+    num_warmup_steps = int(WARMUP_PROPORTION * num_training_steps)
+
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+    )
+    print(
+        f"LR Scheduler: Cosine Annealing with Warmup. Total steps: {num_training_steps}, Warmup steps: {num_warmup_steps}"
+    )
 
     # Lists to store metrics for plotting
     history_train_losses = []
     history_val_losses = []
     history_val_accuracies = []
+    history_lrs = []  # To store learning rates
     epochs_ran = []
 
-    # 4. Training Loop
+    # 5. Training Loop
     print("Starting training...")
     for epoch in range(NUM_EPOCHS):
         epochs_ran.append(epoch + 1)
         # --- Training Phase ---
         model.train()
         train_loss_epoch = 0.0
-        train_accuracy_calculator = evaluate.load(
-            "accuracy"
-        )  # New calculator for each epoch's train acc
+        train_accuracy_calculator = evaluate.load("accuracy")
         progress_bar_train = tqdm(
             train_loader, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS} [Train]"
         )
 
+        current_epoch_lrs = []  # Store LRs within an epoch if needed, or just end of epoch LR
         for batch_idx, batch in enumerate(progress_bar_train):
             inputs = batch["pixel_values"].to(DEVICE)
             labels = batch["labels"].to(DEVICE)
@@ -321,6 +322,7 @@ if __name__ == "__main__":
 
             loss.backward()
             optimizer.step()
+            lr_scheduler.step()  # Step the scheduler after optimizer update
 
             train_loss_epoch += loss.item()
             predictions = torch.argmax(logits, dim=-1)
@@ -328,27 +330,26 @@ if __name__ == "__main__":
                 predictions=predictions, references=labels
             )
 
-            if batch_idx % 20 == 0:
-                progress_bar_train.set_postfix(
-                    {
-                        "loss": loss.item(),
-                        "avg_loss": train_loss_epoch / (batch_idx + 1),
-                    }
-                )
+            current_lr = optimizer.param_groups[0]["lr"]
+            current_epoch_lrs.append(current_lr)
+
+            if batch_idx % 20 == 0:  # Log less frequently
+                progress_bar_train.set_postfix({"loss": loss.item(), "lr": current_lr})
 
         avg_train_loss = train_loss_epoch / len(train_loader)
         train_accuracy = train_accuracy_calculator.compute()["accuracy"]
         history_train_losses.append(avg_train_loss)
+        history_lrs.append(
+            optimizer.param_groups[0]["lr"]
+        )  # LR at the end of the epoch
         print(
-            f"Epoch {epoch + 1} [Train] - Avg Loss: {avg_train_loss:.4f}, Accuracy: {train_accuracy:.4f}"
+            f"Epoch {epoch + 1} [Train] - Avg Loss: {avg_train_loss:.4f}, Accuracy: {train_accuracy:.4f}, LR: {optimizer.param_groups[0]['lr']:.2e}"
         )
 
         # --- Validation Phase ---
         model.eval()
         val_loss_epoch = 0.0
-        val_accuracy_calculator = evaluate.load(
-            "accuracy"
-        )  # New calculator for each epoch's val acc
+        val_accuracy_calculator = evaluate.load("accuracy")
         progress_bar_val = tqdm(
             val_loader, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS} [Val]"
         )
@@ -378,9 +379,6 @@ if __name__ == "__main__":
         )
         print("-" * 50)
 
-        # Plot and save metrics at the end of each epoch (or after N epochs)
-        # For now, plotting at the end of all epochs
-
     # Plot and save metrics after all epochs are done
     if NUM_EPOCHS > 0:
         plot_and_save_metrics(
@@ -388,6 +386,7 @@ if __name__ == "__main__":
             history_train_losses,
             history_val_losses,
             history_val_accuracies,
+            history_lrs,  # Pass recorded LRs
             PLOT_FILENAME,
         )
 
