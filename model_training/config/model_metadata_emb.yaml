@@ -1,9 +1,9 @@
 model:
-  input_dim: 1024
+  input_dim: 4096
   output_dim: 10
 
 audio_emb: False
-metadata_emb: False
+metadata_emb: True
 # vector_augmentation:
 #   video_emb: 0.01
 #   metadata_emb: 0.01
@@ -14,8 +14,8 @@ optimizer:
 
 scheduler:
   warmup_epochs: 1
-  steps_per_epoch: 90
-  total_epochs: 10
+  steps_per_epoch: 180
+  total_epochs: 20
   min_lr: 0.000001
 
 dataset:
@@ -27,14 +27,14 @@ dataset:
   
 dataloader:
   train:
-    batch_size: 16
+    batch_size: 8
     num_workers: 16
     pin_memory: True
     persistent_workers: True
     shuffle: True
     drop_last: True
   val:
-    batch_size: 64
+    batch_size: 8
     num_workers: 4
     pin_memory: True
     persistent_workers: True
