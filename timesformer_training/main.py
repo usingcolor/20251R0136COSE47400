@@ -16,15 +16,15 @@ import evaluate  # For accuracy metric
 import matplotlib.pyplot as plt
 
 # --- Configuration ---
-VIDEO_ROOT_DIR = "yt-8m"
+VIDEO_ROOT_DIR = "/home/elicer/yt-8m"
 TRAIN_DIR = os.path.join(VIDEO_ROOT_DIR, "train")
 VAL_DIR = os.path.join(VIDEO_ROOT_DIR, "validation")
 PRETRAINED_MODEL_NAME = "facebook/timesformer-base-finetuned-k400"
 
 NUM_CLASSES = 10
-BATCH_SIZE = 4
-NUM_EPOCHS = 5  # Consider increasing for scheduler to have more effect
-LEARNING_RATE = 3e-5  # Initial learning rate
+BATCH_SIZE = 8
+NUM_EPOCHS = 10  # Consider increasing for scheduler to have more effect
+LEARNING_RATE = 1e-4  # Initial learning rate
 WARMUP_PROPORTION = 0.1  # Proportion of total training steps for linear warmup
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PLOT_FILENAME = "training_metrics.png"
