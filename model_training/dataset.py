@@ -67,6 +67,13 @@ class VectorDataset(Dataset):
             visual_text_features = torch.tensor(visual_text_features[:])
             audio_features = torch.tensor(audio_features[:])
             embedded_string_metadata = torch.tensor(embedded_string_metadata[:])
+
+            visual_text_features = visual_text_features / visual_text_features.norm()
+            audio_features = audio_features / audio_features.norm()
+            embedded_string_metadata = (
+                embedded_string_metadata / embedded_string_metadata.norm()
+            )
+
         return visual_text_features, audio_features, embedded_string_metadata, label
 
     def __len__(self):
