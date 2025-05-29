@@ -20,6 +20,10 @@ class VectorDataset(Dataset):
                 self.embedding_files.append(embedding_file)
                 self.labels.append(label_idx)
 
+        print(
+            f"Found {len(self.embedding_files)} embedding files across {len(self.class_names)} classes."
+        )
+
     def __getitem__(self, index):
         if index < 0 or index >= len(self.embedding_files):
             raise IndexError("Index out of bounds for dataset.")

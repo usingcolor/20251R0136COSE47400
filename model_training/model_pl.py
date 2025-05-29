@@ -4,6 +4,7 @@ import torch.nn as nn
 import lightning as L
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from dataset import VectorDataset
+from model import MLPModel
 
 
 class VideoClassificationPL(L.LightningModule):
@@ -12,7 +13,7 @@ class VideoClassificationPL(L.LightningModule):
         self.save_hyperparameters()
         self.config = config
 
-        self.model = None  # TODO
+        self.model = MLPModel(**self.config.model)
 
         self.criterion = nn.CrossEntropyLoss()
 
@@ -22,29 +23,32 @@ class VideoClassificationPL(L.LightningModule):
     def common_step(self, batch, batch_idx):
         video_emb, audio_emb, metadata_emb, label = batch
         inputs = video_emb
-        if self.vector_augmentation is not None:
+        if "vector_augmentation" in self.config:
             video_emb = (
                 video_emb
-                + torch.randn_like(video_emb) * self.vector_augmentation.video_emb
+                + torch.randn_like(video_emb)
+                * self.config.vector_augmentation.video_emb
             )
             video_emb = video_emb / video_emb.norm(dim=1, keepdim=True)
 
             audio_emb = (
                 audio_emb
-                + torch.randn_like(audio_emb) * self.vector_augmentation.audio_emb
+                + torch.randn_like(audio_emb)
+                * self.config.vector_augmentation.audio_emb
             )
             audio_emb = audio_emb / audio_emb.norm(dim=1, keepdim=True)
 
             metadata_emb = (
                 metadata_emb
-                + torch.randn_like(metadata_emb) * self.vector_augmentation.metadata_emb
+                + torch.randn_like(metadata_emb)
+                * self.config.vector_augmentation.metadata_emb
             )
             metadata_emb = metadata_emb / metadata_emb.norm(dim=1, keepdim=True)
 
-        if self.audio_emb:
+        if self.config.audio_emb:
             inputs = torch.cat((inputs, audio_emb), dim=1)
 
-        if self.metadata_emb:
+        if self.config.metadata_emb:
             inputs = torch.cat((inputs, metadata_emb), dim=1)
 
         y_hat = self(inputs)
@@ -63,8 +67,8 @@ class VideoClassificationPL(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         loss, y_hat, label = self.common_step(batch, batch_idx)
         acc = (y_hat.argmax(dim=1) == label).float().mean()
-        self.log("val/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("val/acc", acc, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("val/loss", loss, on_epoch=True, prog_bar=True)
+        self.log("val/acc", acc, on_epoch=True, prog_bar=True)
         return loss
 
     # def test_step(self, batch, batch_idx):
@@ -78,9 +82,7 @@ class VideoClassificationPL(L.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), **self.config.optimizer)
-        # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        #     optimizer, **self.config.scheduler
-        # )
+
         steps_per_epoch = self.config.scheduler.steps_per_epoch
         total_steps = self.config.scheduler.total_epochs * steps_per_epoch
         warmup_steps = self.config.scheduler.warmup_epochs * steps_per_epoch

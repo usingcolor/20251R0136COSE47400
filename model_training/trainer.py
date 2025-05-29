@@ -6,6 +6,8 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 
 from lightning.pytorch.loggers import WandbLogger
 
+from model_pl import VideoClassificationPL
+
 
 def main(train_config, model_config, ckpt_path=None, wandb_id=None):
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -15,9 +17,11 @@ def main(train_config, model_config, ckpt_path=None, wandb_id=None):
     model_config = OmegaConf.load(model_config)
     train_config = OmegaConf.load(train_config)
 
-    model = None  # TODO
+    model = VideoClassificationPL(model_config)
 
-    wandb_logger = WandbLogger(entity="translomo", project="MambaEye", id=wandb_id)
+    wandb_logger = WandbLogger(
+        entity="translomo", project="DeepLearningTeamProject", id=wandb_id
+    )
     wandb_logger.watch(model)
 
     wandb_id = wandb_logger.experiment.id
@@ -26,9 +30,9 @@ def main(train_config, model_config, ckpt_path=None, wandb_id=None):
         **train_config,
         callbacks=[
             ModelCheckpoint(
-                monitor="val/classification_loss_last",
+                monitor="val/loss",
                 dirpath="checkpoints/",
-                filename=f"{wandb_id}_" + "{epoch}_{val/loss:.2f}_{val/acc_last:.2f}",
+                filename=f"{wandb_id}_" + "{epoch}_{val/loss:.2f}_{val/acc:.2f}",
                 save_top_k=5,
             )
         ],
