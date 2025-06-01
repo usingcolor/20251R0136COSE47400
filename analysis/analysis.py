@@ -24,7 +24,7 @@ data = {
         72.8, 73.9, 81.1, 79.4,
         72.2, 72.8, 73.3, 75.0, 70.0,
         81.1, 80.0, 80.0, 82.2,
-        80.6, 81.1, 78.3, 86.0
+        80.6, 81.1, 78.3, 79.4
     ]
 }
 
@@ -43,4 +43,4 @@ plt.tight_layout()
 
 plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
 
-plt.show()
+plt.savefig("/home/hwanseok/20251R0136COSE47400/analysis/accuracy_plot.png")
